@@ -1,372 +1,223 @@
-import asyncio
+import time
 import random
 import re
 import hashlib
-from typing import List, Dict, Set
 import pandas as pd
-from playwright.async_api import async_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeoutError
-from playwright_stealth import Stealth
-
+from seleniumbase import Driver
+from bs4 import BeautifulSoup
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 class SemanticScholarScraper:
-    
     def __init__(self, query: str = "computer architecture", limit: int = 50):
         self.query = query
         self.limit = limit
         self.base_url = "https://www.semanticscholar.org"
-        self.search_url = f"{self.base_url}/search?q={query.replace(' ', '%20')}&sort=relevance"
-        
-        self.papers: List = []
-        self.authors: Dict = {}
-        self.paper_authors: List = []
-        self.author_urls_to_scrape: Set[str] = set()
-        self.stealth = Stealth()
+        self.papers = []
+        self.authors = {}
+        self.paper_authors = []
+        self.driver = None  # We now track the driver at the class level
 
-    async def run(self):
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-dev-shm-usage",
-                    "--no-sandbox"
-                ]
-            )
-            
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-                viewport={"width": 1920, "height": 1080},
-                locale="en-US",
-                extra_http_headers={
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
-                }
-            )
-            
-            page = await context.new_page()
-            await self.stealth.apply_stealth_async(page)
-            
-            print(f"--- Starting Scraper for query: '{self.query}' (with stealth mode ✓) ---")
-            
-            await self._scrape_search_results(page)
-            
-            print(f"--- Extracting details for {len(self.author_urls_to_scrape)} unique authors ---")
-            await self._scrape_author_profiles(context)
-            
-            await browser.close()
+    def _start_browser(self):
+        """Spins up a fresh browser instance and clears initial checks."""
+        self._kill_browser()  # Ensure any old instances are dead
+        print("   🌐 Starting a fresh browser instance...")
+        self.driver = Driver(uc=True, headless=False)
+        self.driver.uc_open_with_reconnect(self.base_url, reconnect_time=5)
+        time.sleep(3)
+
+    def _kill_browser(self):
+        """Safely shuts down the current browser."""
+        if self.driver:
+            try:
+                self.driver.quit()
+            except:
+                pass
+            self.driver = None
+
+    def run(self):
+        print(f"--- Starting Hard-Reset Scraper for: '{self.query}' ---")
+        self._start_browser()
+        
+        try:
+            self._scrape_interleaved()
+        except Exception as e:
+            print(f"\n❌ Scraping interrupted by fatal error: {e}")
+        finally:
             self._export_data()
-            print("--- Scraping Complete. Data saved to CSV. ---")
+            self._kill_browser()
+            print("\n--- Scraping Complete ---")
 
-    async def _scrape_search_results(self, page: Page):
-        print(f"Navigating to: {self.search_url}")
-        await page.goto(self.search_url, wait_until="networkidle")
-        await asyncio.sleep(2)
+    def _handle_verification(self):
+        """Attempts to bypass human verification popups."""
+        try:
+            if "verify" in self.driver.current_url.lower() or self.driver.is_element_present("iframe[src*='turnstile']"):
+                print(" 🤖 CAPTCHA detected! Attempting bypass...", end=" ")
+                self.driver.uc_gui_click_captcha()
+                time.sleep(4)
+        except:
+            pass
+
+    def _scrape_interleaved(self):
+        page_count = 1
         
-        page_count = 0
         while len(self.papers) < self.limit:
-            page_count += 1
-            print(f"Processing search page {page_count}. Papers collected so far: {len(self.papers)}")
+            search_url = f"{self.base_url}/search?q={self.query.replace(' ', '%20')}&sort=relevance&page={page_count}"
+            print(f"\n⚓ Loading Search Page {page_count}...")
             
             try:
-                await page.wait_for_selector('[data-test-id="search-result"]', timeout=10000)
-            except PlaywrightTimeoutError:
-                try:
-                    await page.wait_for_selector('.cl-paper-row', timeout=5000)
-                except PlaywrightTimeoutError:
-                    print("Timeout waiting for paper results. Taking screenshot for debug.")
-                    await page.screenshot(path=f"debug_timeout_page_{page_count}.png")
-                    with open(f"debug_page_{page_count}.html", "w", encoding="utf-8") as f:
-                        f.write(await page.content())
-                    print(f"Saved debug files: debug_timeout_page_{page_count}.png and debug_page_{page_count}.html")
-                    break
+                self.driver.uc_open_with_reconnect(search_url, reconnect_time=4)
+                self._handle_verification()
 
-            cards = []
-            selectors_to_try = [
-                '[data-test-id="search-result"]',
-                '[data-test-id="paper-card"]',
-                '.cl-paper-row',
-                'div[class*="search-result"]'
-            ]
+                # Wait for search results
+                WebDriverWait(self.driver, 15).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, ".cl-paper-row, [data-test-id='search-result']"))
+                )
+            except Exception as e:
+                print(f"   ⚠️ Page {page_count} blocked or failed to load. Initiating Hard Reset...")
+                self._start_browser()
+                continue  # Retry the exact same search page
             
-            for selector in selectors_to_try:
-                cards = await page.query_selector_all(selector)
-                if cards:
-                    print(f"Found {len(cards)} papers using selector: {selector}")
-                    break
+            html = self.driver.get_page_source()
+            soup = BeautifulSoup(html, "html.parser")
+            cards = soup.select(".cl-paper-row, [data-test-id='search-result']")
             
             if not cards:
-                print("No paper cards found with any selector. Stopping.")
-                break
-            
+                print("   ❌ No paper cards found on this page. Moving to next.")
+                page_count += 1
+                continue
+
+            author_queue = []
+
             for card in cards:
-                if len(self.papers) >= self.limit:
-                    break
+                if len(self.papers) >= self.limit: break
                 
-                title = "Unknown Title"
-                title_selectors = ['h3 a', 'h2 a', 'a[data-heap-id="paper_title"]', '.cl-paper-title']
+                title_el = card.select_one('h3, h2, .cl-paper-title')
+                title = title_el.text.strip() if title_el else "Unknown"
+                link_el = card.select_one('a[href*="/paper/"]')
+                paper_url = self.base_url + link_el['href'] if link_el else "N/A"
+                paper_id = paper_url.split('/')[-1] if paper_url != "N/A" else hashlib.md5(title.encode()).hexdigest()[:16]
+
+                self.papers.append({"paper_id": paper_id, "title": title, "url": paper_url})
                 
-                for title_sel in title_selectors:
-                    title_el = await card.query_selector(title_sel)
-                    if title_el:
-                        title = await title_el.inner_text()
-                        title = title.strip()
-                        break
-                
-                paper_url = "N/A"
-                paper_s2_id = None
-                
-                link_selectors = [
-                    'a[href*="/paper/"]',
-                    'h3 a[href]',
-                    'h2 a[href]',
-                    'a[data-heap-id="paper_title"]'
-                ]
-                
-                for link_sel in link_selectors:
-                    link_el = await card.query_selector(link_sel)
-                    if link_el:
-                        relative_url = await link_el.get_attribute('href')
-                        if relative_url and '/paper/' in relative_url:
-                            if not relative_url.startswith('http'):
-                                paper_url = self.base_url + relative_url
-                            else:
-                                paper_url = relative_url
-                            
-                            parts = relative_url.rstrip('/').split('/')
-                            paper_s2_id = parts[-1]
-                            break
-                
-                if not paper_s2_id:
-                    paper_s2_id = hashlib.md5(title.encode()).hexdigest()[:16]
-                
-                year = None
-                citation_count = None
-                
-                year_el = await card.query_selector('.cl-paper-pubdates')
-                if year_el:
-                    year_text = await year_el.inner_text()
-                    year_match = re.search(r'\b(19|20)\d{2}\b', year_text)
-                    if year_match:
-                        year = int(year_match.group())
-                
-                citation_el = await card.query_selector('.cl-paper-stats__citation-pdp-link')
-                if not citation_el:
-                    citation_el = await card.query_selector('[data-heap-id="citation_count"]')
-                
-                if citation_el:
-                    citation_text = await citation_el.inner_text()
-                    citation_match = re.search(r'([\d,]+)', citation_text)
-                    if citation_match:
-                        try:
-                            citation_count = int(citation_match.group(1).replace(',', ''))
-                        except ValueError:
-                            pass
-                
-                self.papers.append({
-                    "paper_id": paper_s2_id,
-                    "title": title,
-                    "url": paper_url,
-                    "year": year,
-                    "citation_count": citation_count
-                })
-                
-                author_selectors = [
-                    '.cl-paper-authors a.author-list__link',
-                    '.cl-paper-authors a',
-                    'span[data-heap-id="heap_author_list"] a',
-                    'a[href*="/author/"]'
-                ]
-                
-                author_els = []
-                for auth_sel in author_selectors:
-                    author_els = await card.query_selector_all(auth_sel)
-                    if author_els:
-                        break
-                
-                for auth_el in author_els:
-                    auth_name = await auth_el.inner_text()
-                    auth_name = auth_name.strip()
-                    auth_href = await auth_el.get_attribute('href')
+                for order, auth_el in enumerate(card.select('a[href*="/author/"]'), 1):
+                    auth_href = auth_el.get('href', '')
+                    if not auth_href: continue
+                    auth_id = auth_href.split('/')[-1]
                     
-                    if auth_href and '/author/' in auth_href:
-                        if not auth_href.startswith('http'):
-                            full_auth_url = self.base_url + auth_href
+                    self.paper_authors.append({"paper_id": paper_id, "author_id": auth_id, "author_order": order})
+                    
+                    if auth_id not in self.authors:
+                        self.authors[auth_id] = {
+                            "author_id": auth_id, 
+                            "author_name": auth_el.text.strip(), 
+                            "author_profile_url": self.base_url + auth_href, 
+                            "citation_count": None
+                        }
+                        author_queue.append(auth_id)
+
+            if author_queue:
+                print(f"   👥 Processing {len(author_queue)} authors...")
+                idx = 0
+                retries = 0
+                
+                # Using a while loop so we can retry the same index if it fails
+                while idx < len(author_queue):
+                    aid = author_queue[idx]
+                    try:
+                        self._scrape_single_author(aid)
+                        time.sleep(random.uniform(2.0, 3.5))
+                        idx += 1       # Success! Move to the next author
+                        retries = 0    # Reset retries
+                        
+                    except Exception as e:
+                        retries += 1
+                        print(f"\n      💥 Browser crashed or blocked! (Attempt {retries}/3)")
+                        
+                        if retries > 2:
+                            print(f"      ⏭️ Skipping author {aid} after 3 failed browser resets.")
+                            idx += 1
+                            retries = 0
                         else:
-                            full_auth_url = auth_href
-                        
-                        parts = auth_href.rstrip('/').split('/')
-                        author_id = parts[-1]
-                        
-                        self.paper_authors.append({
-                            "paper_id": paper_s2_id,
-                            "author_id": author_id
-                        })
-                        
-                        if author_id not in self.authors:
-                            self.authors[author_id] = {
-                                "author_id": author_id,
-                                "name": auth_name,
-                                "profile_url": full_auth_url,
-                                "citation_count": None
-                            }
-                            self.author_urls_to_scrape.add(full_auth_url)
+                            self._start_browser() # The Hard Reset
 
-            if len(self.papers) < self.limit:
-                print("Looking for next page...")
-                
-                next_button = None
-                next_selectors = [
-                    '[data-test-id="pagination-next-button"]',
-                    'button[aria-label="Next page"]',
-                    '.cl-pager__button--next',
-                    'a.cl-pager__button[rel="next"]'
-                ]
-                
-                for next_sel in next_selectors:
-                    next_button = await page.query_selector(next_sel)
-                    if next_button:
-                        break
-                
-                if next_button:
-                    is_disabled = await next_button.get_attribute('disabled')
-                    is_enabled = await next_button.is_enabled()
-                    
-                    if is_enabled and not is_disabled:
-                        print("Navigating to next page...")
-                        await next_button.click()
-                        await page.wait_for_load_state('networkidle')
-                        await asyncio.sleep(random.uniform(2.0, 4.0))
+            page_count += 1
+
+    def _scrape_single_author(self, author_id):
+        author_data = self.authors[author_id]
+        print(f"      👤 {author_data['author_name'][:30]}...", end=" ", flush=True)
+        
+        self.driver.uc_open_with_reconnect(author_data['author_profile_url'], reconnect_time=3)
+        
+        try:
+            WebDriverWait(self.driver, 8).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".author-detail-card__stats-row__value, .author-detail-card"))
+            )
+        except:
+            self._handle_verification()
+            # If it still fails after trying to handle it, we force an error to trigger the Hard Reset
+            WebDriverWait(self.driver, 3).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".author-detail-card"))
+            )
+
+        html = self.driver.get_page_source()
+        soup = BeautifulSoup(html, "html.parser")
+        citation_count = self._extract_author_citations_only(soup)
+        
+        self.authors[author_id]['citation_count'] = citation_count
+        print(f"✓ {citation_count}")
+
+    def _extract_author_citations_only(self, soup):
+        citation_count = None
+        stats_rows = soup.select('.author-detail-card__stats-row')
+        for row in stats_rows:
+            label = row.select_one('.author-detail-card__stats-row__label')
+            value = row.select_one('.author-detail-card__stats-row__value')
+            if label and value:
+                label_text = label.get_text().strip().lower()
+                if 'citation' in label_text and 'influential' not in label_text:
+                    value_text = value.get_text().replace(',', '').strip()
+                    if 'k' in value_text.lower():
+                        try:
+                            citation_count = int(float(value_text.lower().replace('k', '')) * 1000)
+                            break
+                        except: pass
                     else:
-                        print("Next button is disabled. No more pages available.")
-                        break
-                else:
-                    print("No next button found. Reached end of results.")
-                    break
-            
-            if page_count > 20:
-                print("Reached maximum page limit (20 pages). Stopping.")
-                break
-
-    async def _scrape_author_profiles(self, context: BrowserContext):
-        total_authors = len(self.author_urls_to_scrape)
-        successful = 0
-        failed = 0
+                        match = re.search(r'(\d+)', value_text)
+                        if match:
+                            citation_count = int(match.group(1))
+                            break
         
-        for i, auth_url in enumerate(self.author_urls_to_scrape, 1):
-            author_id = auth_url.split('/')[-1]
-            
-            if i % 5 == 0 or i == total_authors:
-                print(f"Scraping author {i}/{total_authors} (✓ {successful}, ✗ {failed})")
-
-            page = await context.new_page()
-            await self.stealth.apply_stealth_async(page)
-            
-            try:
-                await page.goto(auth_url, wait_until="domcontentloaded", timeout=15000)
-                
-                citation_count = 0
-                
-                try:
-                    await page.wait_for_selector('.author-detail-cards', timeout=5000)
-                    
-                    selectors_to_try = [
-                        '.author-detail-cards__stat-value',
-                        '[data-test-id="author-citation-count"]',
-                        '.stats-row__stat-value',
-                        'div.author-stats'
-                    ]
-                    
-                    for selector in selectors_to_try:
-                        elements = await page.query_selector_all(selector)
-                        for elem in elements:
-                            text = await elem.inner_text()
-                            match = re.search(r'([\d,]+)', text)
-                            if match:
-                                try:
-                                    potential_count = int(match.group(1).replace(',', ''))
-                                    if 0 <= potential_count <= 1000000:
-                                        citation_count = max(citation_count, potential_count)
-                                except ValueError:
-                                    pass
-                    
-                    if citation_count == 0:
-                        page_text = await page.inner_text('body')
-                        patterns = [
-                            r'([\d,]+)\s*(?:Total\s+)?Citations?',
-                            r'Citations?\s*[:\-]?\s*([\d,]+)',
-                            r'([\d,]+)\s*\n\s*Citations?'
-                        ]
-                        
-                        for pattern in patterns:
-                            match = re.search(pattern, page_text, re.IGNORECASE)
-                            if match:
-                                count_str = match.group(1).replace(',', '')
-                                try:
-                                    citation_count = int(count_str)
-                                    break
-                                except ValueError:
-                                    pass
-                    
-                except PlaywrightTimeoutError:
-                    pass
-                
-                self.authors[author_id]['citation_count'] = citation_count
-                successful += 1
-                
-            except Exception as e:
-                print(f"Failed to load profile {auth_url}: {str(e)[:100]}")
-                failed += 1
-                self.authors[author_id]['citation_count'] = None
-            
-            finally:
-                await page.close()
-                await asyncio.sleep(random.uniform(1.0, 2.5))
+        if citation_count is None:
+            page_text = soup.get_text()
+            if "Co-Authors" in page_text or "Co-Author" in page_text:
+                main_section = page_text.split("Co-Author")[0]
+            else:
+                main_section = page_text[:2000]
+            match = re.search(r'([\d,]+)\s+Citations', main_section)
+            if match:
+                citation_count = int(match.group(1).replace(',', ''))
         
-        print(f"Author scraping complete: {successful} successful, {failed} failed")
+        if citation_count is None:
+            main_card = soup.select_one('.author-detail-card')
+            if main_card:
+                card_text = main_card.get_text()
+                match = re.search(r'([\d,]+)\s+Citations', card_text)
+                if match:
+                    citation_count = int(match.group(1).replace(',', ''))
+        
+        return citation_count if citation_count else 0
 
     def _export_data(self):
-        print("\n--- Exporting Data ---")
-        
-        df_papers = pd.DataFrame(self.papers)
-        df_papers.drop_duplicates(subset='paper_id', inplace=True)
-        df_papers.to_csv("papers.csv", index=False)
-        print(f"✓ Exported {len(df_papers)} papers to papers.csv")
-        
-        df_authors = pd.DataFrame(list(self.authors.values()))
-        df_authors.to_csv("authors.csv", index=False)
-        print(f"✓ Exported {len(df_authors)} authors to authors.csv")
-        
-        df_paper_authors = pd.DataFrame(self.paper_authors)
-        df_paper_authors.drop_duplicates(inplace=True)
-        df_paper_authors.to_csv("paper_authors.csv", index=False)
-        print(f"✓ Exported {len(df_paper_authors)} paper-author relationships to paper_authors.csv")
-        
-        print("\n--- Summary Statistics ---")
-        print(f"Total papers scraped: {len(df_papers)}")
-        print(f"Total unique authors: {len(df_authors)}")
-        print(f"Average authors per paper: {len(df_paper_authors) / len(df_papers):.1f}")
-        if 'citation_count' in df_papers.columns:
-            print(f"Papers with citation data: {df_papers['citation_count'].notna().sum()}")
-        if 'citation_count' in df_authors.columns:
-            print(f"Authors with citation data: {df_authors['citation_count'].notna().sum()}")
-
+        try:
+            pd.DataFrame(self.papers).drop_duplicates(subset='paper_id').to_csv("papers.csv", index=False)
+            pd.DataFrame(list(self.authors.values())).to_csv("authors.csv", index=False)
+            pd.DataFrame(self.paper_authors).drop_duplicates().to_csv("paper_authors.csv", index=False)
+            print("   💾 Data successfully exported to CSVs.")
+        except Exception as e:
+            print(f"   ⚠️ Failed to export data: {e}")
 
 if __name__ == "__main__":
-    import sys
-    
-    query = "computer architecture"
-    limit = 50
-    
-    if len(sys.argv) > 1:
-        query = sys.argv[1]
-    if len(sys.argv) > 2:
-        try:
-            limit = int(sys.argv[2])
-        except ValueError:
-            print(f"Invalid limit '{sys.argv[2]}', using default: 50")
-    
-    print(f"Starting scraper with query='{query}', limit={limit}")
-    print()
-    
-    scraper = SemanticScholarScraper(query=query, limit=limit)
-    asyncio.run(scraper.run())
+    scraper = SemanticScholarScraper(query="computer architecture", limit=50)
+    scraper.run()
