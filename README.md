@@ -44,3 +44,9 @@ Hardware Overhead: Running full browser instances (even headless) consumes signi
 API Integration: In a true production environment, scraping Semantic Scholar is unnecessary and inefficient. I would transition this to use the official Semantic Scholar Academic Graph (S2AG) API, which is legal, infinitely faster, and provides cleaner JSON data. (And I only need less than 100 line of code to get the things we wanted (but I assume this is not what we wanted so I chose to use this))
 
 Checkpointing: For scraping thousands of records, I would implement database checkpointing (e.g., SQLite) rather than in-memory Python lists to prevent data loss in the event of a fatal system crash. 
+
+
+# SET UP
+Run pip install -r requirements.txt
+Run sbase install chromedriver
+And then last run python main.py
