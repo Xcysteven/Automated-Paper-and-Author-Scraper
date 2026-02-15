@@ -22,7 +22,7 @@ class SemanticScholarScraper:
     def _start_browser(self):
         """Spins up a fresh browser instance and clears initial checks."""
         self._kill_browser()  # Ensure any old instances are dead
-        print("   🌐 Starting a fresh browser instance...")
+        print("   Starting a fresh browser instance...")
         self.driver = Driver(uc=True, headless=False)
         self.driver.uc_open_with_reconnect(self.base_url, reconnect_time=5)
         time.sleep(3)
@@ -43,7 +43,7 @@ class SemanticScholarScraper:
         try:
             self._scrape_interleaved()
         except Exception as e:
-            print(f"\n❌ Scraping interrupted by fatal error: {e}")
+            print(f"\nScraping interrupted by fatal error: {e}")
         finally:
             self._export_data()
             self._kill_browser()
@@ -53,7 +53,7 @@ class SemanticScholarScraper:
         """Attempts to bypass human verification popups."""
         try:
             if "verify" in self.driver.current_url.lower() or self.driver.is_element_present("iframe[src*='turnstile']"):
-                print(" 🤖 CAPTCHA detected! Attempting bypass...", end=" ")
+                print(" CAPTCHA detected! Attempting bypass...", end=" ")
                 self.driver.uc_gui_click_captcha()
                 time.sleep(4)
         except:
@@ -75,7 +75,7 @@ class SemanticScholarScraper:
                     EC.presence_of_element_located((By.CSS_SELECTOR, ".cl-paper-row, [data-test-id='search-result']"))
                 )
             except Exception as e:
-                print(f"   ⚠️ Page {page_count} blocked or failed to load. Initiating Hard Reset...")
+                print(f"   Page {page_count} blocked or failed to load. Initiating Hard Reset...")
                 self._start_browser()
                 continue  # Retry the exact same search page
             
@@ -84,7 +84,7 @@ class SemanticScholarScraper:
             cards = soup.select(".cl-paper-row, [data-test-id='search-result']")
             
             if not cards:
-                print("   ❌ No paper cards found on this page. Moving to next.")
+                print("   No paper cards found on this page. Moving to next.")
                 page_count += 1
                 continue
 
@@ -128,7 +128,7 @@ class SemanticScholarScraper:
                     try:
                         self._scrape_single_author(aid)
                         time.sleep(random.uniform(2.0, 3.5))
-                        idx += 1       # Success! Move to the next author
+                        idx += 1       # Success
                         retries = 0    # Reset retries
                         
                     except Exception as e:
@@ -214,9 +214,9 @@ class SemanticScholarScraper:
             pd.DataFrame(self.papers).drop_duplicates(subset='paper_id').to_csv("papers.csv", index=False)
             pd.DataFrame(list(self.authors.values())).to_csv("authors.csv", index=False)
             pd.DataFrame(self.paper_authors).drop_duplicates().to_csv("paper_authors.csv", index=False)
-            print("   💾 Data successfully exported to CSVs.")
+            print("   Data successfully exported to CSVs.")
         except Exception as e:
-            print(f"   ⚠️ Failed to export data: {e}")
+            print(f"   Failed to export data: {e}")
 
 if __name__ == "__main__":
     scraper = SemanticScholarScraper(query="computer architecture", limit=50)
