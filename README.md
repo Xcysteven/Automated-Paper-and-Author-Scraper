@@ -48,5 +48,7 @@ Checkpointing: For scraping thousands of records, I would implement database che
 
 # SET UP
 Run pip install -r requirements.txt
+
 Run sbase install chromedriver
+
 And then last run python main.py
