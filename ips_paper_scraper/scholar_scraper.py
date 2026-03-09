@@ -3,13 +3,9 @@ import time
 import random
 import urllib.parse
 import os
-import pickle
-import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from seleniumbase import Driver
 from bs4 import BeautifulSoup
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
 
 class GoogleScholarScraper:
     def __init__(self, db_name="neurips_research.db", session_dir="sessions"):
@@ -17,99 +13,55 @@ class GoogleScholarScraper:
         self.base_url = "https://scholar.google.com"
         self.driver = None
         self.session_dir = session_dir
-        self.block_start_time = None
         self.consecutive_blocks = 0
-        self.last_request_time = None
+        self.papers_in_session = 0
+        self.max_papers_per_session = 15  # Restart browser after 15 papers
         
-        # Create session directory
         os.makedirs(session_dir, exist_ok=True)
         
-        # User agents for rotation
+        # More realistic user agents with proper formats
         self.user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
-        ]
-        
-        # Referers for realistic browsing
-        self.referers = [
-            "https://www.google.com/",
-            "https://www.bing.com/",
-            "https://duckduckgo.com/",
-            "https://scholar.google.com/",
-            None,  # No referer sometimes
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+            "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
         ]
 
     def _get_random_user_agent(self):
-        """Get a random user agent"""
+        """Get a random, realistic user agent"""
         return random.choice(self.user_agents)
 
-    def _get_random_referer(self):
-        """Get a random referer"""
-        return random.choice(self.referers)
-
-    def _get_session_file(self, session_id):
-        """Get path to session file"""
-        return os.path.join(self.session_dir, f"session_{session_id}.pkl")
-
-    def _save_cookies(self, session_id):
-        """Save cookies from current driver"""
-        if self.driver:
-            try:
-                cookies = self.driver.get_cookies()
-                session_file = self._get_session_file(session_id)
-                with open(session_file, 'wb') as f:
-                    pickle.dump(cookies, f)
-            except:
-                pass
-
-    def _load_cookies(self, session_id):
-        """Load cookies into driver"""
-        session_file = self._get_session_file(session_id)
-        if self.driver and os.path.exists(session_file):
-            try:
-                with open(session_file, 'rb') as f:
-                    cookies = pickle.load(f)
-                for cookie in cookies:
-                    try:
-                        self.driver.add_cookie(cookie)
-                    except:
-                        pass
-            except:
-                pass
-
-    def _start_browser(self, session_id="default"):
-        """Start browser with anti-detection measures"""
+    def _start_browser(self):
+        """Start browser with persistent profile and native anti-detection"""
         self._kill_browser()
-        print("   🌐 Starting browser...")
+        print("   🌐 Starting browser with persistent profile...")
         
-        user_agent = self._get_random_user_agent()
-        session_dir = os.path.join(self.session_dir, session_id)
+        # We create a persistent folder to store Google's trust cookies
+        profile_path = os.path.join(os.getcwd(), self.session_dir, "chrome_profile")
         
         try:
-            # Create directories if they don't exist
-            os.makedirs(session_dir, exist_ok=True)
-            
             self.driver = Driver(
                 uc=True,  # Undetected Chrome
-                headless=False,  # Headless is easier to detect
+                headless=False,
+                user_data_dir=profile_path,  # <-- THIS IS THE MAGIC. It saves your cookies!
             )
             
-            # Set user agent via CDP (Chrome DevTools Protocol)
-            self.driver.execute_cdp_cmd("Network.setUserAgentOverride", {
-                "userAgent": user_agent,
-                "platform": "MacIntel" if "Mac" in user_agent else "Linux",
-                "platformVersion": "10.15.7" if "Mac" in user_agent else "5.15.0",
-            })
-            
+            # NOTE: We deleted the execute_cdp_cmd User-Agent override entirely. 
+            # We are letting Undetected Chromedriver use its mathematically perfect default.
+
             # Navigate to base URL
             self.driver.uc_open_with_reconnect(self.base_url, reconnect_time=4)
-            time.sleep(random.uniform(2, 4))
+            time.sleep(random.uniform(3, 6))
             
-            print(f"   ✅ Browser started")
+            # Simulate some random scrolling and waiting on homepage
+            self.driver.execute_script("window.scrollBy(0, window.innerHeight);")
+            time.sleep(random.uniform(1, 3))
+            self.driver.execute_script("window.scrollBy(0, -window.innerHeight);")
+            
+            print("   ✅ Browser started and cookies loaded")
+            self.papers_in_session = 0
             
         except Exception as e:
             print(f"   💥 Failed to start browser: {e}")
@@ -123,6 +75,25 @@ class GoogleScholarScraper:
             except:
                 pass
             self.driver = None
+
+    def _human_like_delay(self):
+        """
+        Simulate human-like browsing delays
+        Humans don't request pages every 8 seconds - they vary much more
+        """
+        # 70% of the time: normal delay (15-25 seconds)
+        if random.random() < 0.7:
+            delay = random.uniform(15, 25)
+        # 20% of the time: shorter delay (10-15 seconds)
+        elif random.random() < 0.86:  # 20/100
+            delay = random.uniform(10, 15)
+        # 10% of the time: longer delay (30-60 seconds) - reading the page
+        else:
+            delay = random.uniform(30, 60)
+        
+        # Add random jitter
+        jitter = random.uniform(0.9, 1.1)
+        return delay * jitter
 
     def _detect_block(self, html_content):
         """Detect if Google is blocking us"""
@@ -146,7 +117,7 @@ class GoogleScholarScraper:
         ]):
             return "captcha"
         
-        # Soft block indicators (rate limiting)
+        # Soft block indicators
         if any(phrase in page_text for phrase in [
             "unusual traffic",
             "too many requests",
@@ -164,56 +135,46 @@ class GoogleScholarScraper:
         if block_type == "hard_block":
             print("\n   🚨 HARD BLOCK DETECTED!")
             print("   Google has issued a hard IP ban.")
-            print("   💤 Sleeping for 2 hours before retry...")
-            self.block_start_time = datetime.now()
-            time.sleep(7200)  # 2 hours
+            print("   💤 Sleeping for 1 hour before retry...")
+            time.sleep(3600)
             self.consecutive_blocks = 0
             return True
         
         elif block_type == "soft_block":
             print("\n   ⚠️ SOFT BLOCK DETECTED (Rate Limiting)")
-            wait_time = min(300 * self.consecutive_blocks, 1800)  # Up to 30 minutes
+            # Exponential backoff
+            wait_time = min(60 * (2 ** self.consecutive_blocks), 600)  # Up to 10 min
             print(f"   😴 Backing off for {wait_time}s ({wait_time//60}m)...")
             time.sleep(wait_time)
             return True
         
         elif block_type == "captcha":
             print("\n   🚨 CAPTCHA DETECTED!")
-            print("   ⏱️ CAPTCHA requires manual solving.")
-            print("   ⏸️ Pausing for 30 minutes to let the block expire...")
-            time.sleep(1800)  # 30 minutes
+            print("   ⏱️ IP is being throttled. Waiting 45 minutes...")
+            time.sleep(2700)  # 45 minutes
             return True
         
         return False
-
-    def _calculate_smart_delay(self):
-        """Calculate intelligent delay with randomization"""
-        base_delay = 15  # Minimum 8 seconds
-        
-        # Increase delays based on consecutive blocks
-        if self.consecutive_blocks > 0:
-            base_delay = min(base_delay + (self.consecutive_blocks * 10), 60)
-        
-        # Add random jitter (±20%)
-        jitter = random.uniform(0.8, 1.2)
-        delay = base_delay * jitter
-        
-        # Occasional longer pauses (5% chance of 3-8 minute pause)
-        if random.random() < 0.05:
-            delay = random.uniform(180, 200)
-        
-        return delay
 
     def _is_valid_result(self, first_result):
         """Check if result looks like actual search result"""
         if not first_result:
             return False
-        
-        # Should have a title element
         if not first_result.select_one('.gs_rt a'):
             return False
-        
         return True
+
+    def _simulate_human_browsing(self):
+        """Simulate human-like browsing behavior"""
+        # Random chance to scroll on the page
+        if random.random() < 0.3:
+            scroll_amount = random.randint(100, 500)
+            self.driver.execute_script(f"window.scrollBy(0, {scroll_amount});")
+            time.sleep(random.uniform(1, 3))
+        
+        # Random chance to hover over elements (pause)
+        if random.random() < 0.2:
+            time.sleep(random.uniform(2, 5))
 
     def run_pipeline(self, limit=30):
         """Main pipeline to process papers"""
@@ -256,10 +217,18 @@ class GoogleScholarScraper:
                 
                 conn.commit()
                 
-                # Smart delay between requests
-                delay = self._calculate_smart_delay()
+                # Human-like delay
+                delay = self._human_like_delay()
                 print(f"   ⏳ Waiting {delay:.1f}s before next request...\n")
                 time.sleep(delay)
+                
+                # Restart browser every 15 papers to get fresh session
+                self.papers_in_session += 1
+                if self.papers_in_session >= self.max_papers_per_session:
+                    print("   🔄 Restarting browser for fresh session...\n")
+                    self._kill_browser()
+                    time.sleep(random.uniform(5, 10))
+                    self._start_browser()
                 
             except Exception as e:
                 error_msg = str(e).lower()
@@ -269,12 +238,8 @@ class GoogleScholarScraper:
                     print("   🛑 Stopping pipeline due to hard block.")
                     break
                 
-                # Mark as failed but continue
-                cursor.execute(
-                    "UPDATE papers SET is_processed = 1, notes = ? WHERE paper_id = ?",
-                    (f"Error: {str(e)[:100]}", paper_id)
-                )
-                conn.commit()
+                # Don't mark as processed - let it retry in next batch
+                print(f"   ⏳ Will retry this paper in next batch...")
         
         conn.close()
         self._kill_browser()
@@ -292,9 +257,13 @@ class GoogleScholarScraper:
         encoded_title = urllib.parse.quote(title)
         search_url = f"{self.base_url}/scholar?hl=en&q={encoded_title}"
         
-        # Navigate to search
+        # Navigate to search with randomized timing
+        time.sleep(random.uniform(1, 2))
         self.driver.uc_open_with_reconnect(search_url, reconnect_time=3)
-        time.sleep(random.uniform(2, 4))
+        time.sleep(random.uniform(3, 5))
+        
+        # Simulate human browsing
+        self._simulate_human_browsing()
         
         # Get page content
         html = self.driver.get_page_source()
@@ -304,10 +273,17 @@ class GoogleScholarScraper:
         block_type = self._detect_block(html)
         if block_type:
             if self._handle_block(block_type):
-                # Retry after handling block
+                # Restart browser after block to get clean session
+                self._kill_browser()
+                time.sleep(random.uniform(5, 15))
+                self._start_browser()
+                
+                # Retry the paper
                 print("   🔄 Retrying after block handling...")
-                self.driver.uc_open_with_reconnect(search_url, reconnect_time=3)
                 time.sleep(random.uniform(2, 4))
+                self.driver.uc_open_with_reconnect(search_url, reconnect_time=3)
+                time.sleep(random.uniform(3, 5))
+                
                 html = self.driver.get_page_source()
                 soup = BeautifulSoup(html, "html.parser")
                 
@@ -319,42 +295,94 @@ class GoogleScholarScraper:
         # Find first result
         first_result = soup.select_one('.gs_ri')
         
-        if not self._is_valid_result(first_result):
-            print("   ⚠️ No valid results found")
-            cursor.execute(
-                "UPDATE papers SET is_processed = 1, notes = ? WHERE paper_id = ?",
-                ("No results found on Google Scholar", paper_id)
-            )
-            return False
+        # Check if Google explicitly says there are no results
+        if "did not match any articles" in soup or "did not match any articles" in html.lower():
+            print("   ⚠️ Genuinely no results found on Google Scholar for this paper.")
+            cursor.execute("""
+                UPDATE papers SET is_processed = 1, notes = 'Zero results on Scholar' 
+                WHERE paper_id = ?
+            """, (paper_id,))
+            return True # Successfully processed (by finding nothing)
+
+        # --- THE SMART RESULT SELECTOR ---
+        results = soup.select('.gs_ri')
+        best_result = None
+        result_title = ""
+        result_url = None
         
-        # Extract abstract
+        # Scan the top 3 results instead of just the first one
+        for result in results[:3]: 
+            title_el = result.select_one('.gs_rt a')
+            if not title_el:
+                title_el = result.select_one('.gs_rt') 
+                
+            raw_title = title_el.text.strip() if title_el else ""
+            
+            # Strip tags like [PDF] or [BOOK]
+            import re
+            clean_title = re.sub(r'^\[.*?\]\s*', '', raw_title)
+            
+            from difflib import SequenceMatcher
+            similarity = SequenceMatcher(None, title.lower(), clean_title.lower()).ratio()
+            
+            # Check the URL and the green "venue" text underneath the title
+            url = title_el.get('href', '').lower() if title_el and title_el.name == 'a' else ""
+            venue_info = result.select_one('.gs_a').text.lower() if result.select_one('.gs_a') else ""
+            
+            # Does this result explicitly mention NeurIPS?
+            is_neurips = "neurips" in url or "nips" in url or "neural information" in venue_info
+            
+            if similarity >= 0.85:
+                if is_neurips:
+                    # Perfect match! It has the right title AND the NeurIPS signature.
+                    best_result = result
+                    result_title = clean_title
+                    result_url = title_el.get('href') if title_el and title_el.name == 'a' else None
+                    break # Stop looking, we found the golden ticket
+                elif best_result is None:
+                    # Good title, but no explicit NeurIPS tag. Save as backup in case we don't find a better one.
+                    best_result = result
+                    result_title = clean_title
+                    result_url = title_el.get('href') if title_el and title_el.name == 'a' else None
+                    
+        if not best_result:
+            print(f"   ⚠️ Mismatch Alert! Google returned unrelated papers or no valid cards.")
+            cursor.execute("""
+                UPDATE papers SET is_processed = 1, notes = 'Skipped: Result mismatch or no NeurIPS tag' 
+                WHERE paper_id = ?
+            """, (paper_id,))
+            return True # Successfully processed (by gracefully skipping)
+            
+        first_result = best_result
+        
+        # Extract abstract from the confirmed best result
         abstract_el = first_result.select_one('.gs_rs')
         abstract = abstract_el.text.strip().replace('\n', ' ') if abstract_el else "No abstract"
-        
-        # Extract paper title from result
-        title_el = first_result.select_one('.gs_rt a')
-        result_title = title_el.text.strip() if title_el else title
-        
-        # Extract URL
-        result_url = None
-        if title_el and title_el.get('href'):
-            result_url = title_el['href']
+        # ---------------------------------
         
         # Update paper record
         cursor.execute("""
-            UPDATE papers SET abstract = ?, is_processed = 1 WHERE paper_id = ?
-        """, (abstract, paper_id))
-
+            UPDATE papers 
+            SET abstract = ?, scholar_title = ?, scholar_url = ?, is_processed = 1, processed_date = ?
+            WHERE paper_id = ?
+        """, (abstract, result_title, result_url, datetime.now().isoformat(), paper_id))
+        
         # Extract authors with Google Scholar profiles
         author_links = first_result.select('.gs_a a[href*="/citations?user="]')
         
         if author_links:
-            print(f"   👥 Found {len(author_links)} Google Scholar authors")
+            # De-duplicate the links (filters out Google's hidden mobile tags)
+            unique_authors = {}
+            for link in author_links:
+                author_name = link.text.strip()
+                gs_url = self.base_url + link['href']
+                # Only add if we actually grabbed text and haven't seen this URL yet
+                if author_name and gs_url not in unique_authors:
+                    unique_authors[gs_url] = author_name
             
-            for author_link in author_links:
-                author_name = author_link.text.strip()
-                gs_url = self.base_url + author_link['href']
-                
+            print(f"   👥 Found {len(unique_authors)} Google Scholar authors")
+            
+            for gs_url, author_name in unique_authors.items():
                 # Insert author
                 cursor.execute("""
                     INSERT OR IGNORE INTO authors (name, gs_url) 
@@ -383,22 +411,21 @@ def main():
     
     print("""
     ╔═══════════════════════════════════════════════════════════════╗
-    ║        Google Scholar Scraper - Self-Hosted Version          ║
-    ║                    No External Services                       ║
+    ║     Google Scholar Scraper - Anti-Detection Optimized        ║
+    ║            Focused on Avoiding CAPTCHAs                      ║
     ╚═══════════════════════════════════════════════════════════════╝
     """)
     
     scraper = GoogleScholarScraper(db_name="neurips_research.db")
     
     batch_num = 1
-    total_processed = 0
     
     while True:
         print(f"\n🚀 BATCH {batch_num}")
         print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
-        # Process batch (100 papers at a time to be conservative)
-        has_more = scraper.run_pipeline(limit=100)
+        # Process smaller batches with better spacing
+        has_more = scraper.run_pipeline(limit=12)
         
         if not has_more:
             print("\n✅ All papers processed!")
@@ -406,12 +433,15 @@ def main():
         
         batch_num += 1
         
-        # Long cooldown between batches
-        cooldown_seconds = 600  # 10 min
+        # Long cooldown between batches - let IP reputation recover
+        cooldown_seconds = 600  # 10 minutes
         print(f"\n🛌 Batch cooldown: {cooldown_seconds}s ({cooldown_seconds//60} minutes)")
+        print("   Letting IP reputation recover before next batch...\n")
         
         for remaining in range(cooldown_seconds, 0, -60):
-            print(f"   ⏳ {remaining}s remaining...", end='\r')
+            mins = remaining // 60
+            secs = remaining % 60
+            print(f"   ⏳ {mins}m {secs}s remaining...", end='\r')
             time.sleep(60)
         
         print("\n" + "="*75)
