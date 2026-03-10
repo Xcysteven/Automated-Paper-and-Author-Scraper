@@ -1,163 +1,184 @@
 import sqlite3
+import requests
 import time
 import random
-import re
-from seleniumbase import Driver
+import urllib.parse
+from difflib import SequenceMatcher
 from bs4 import BeautifulSoup
+from seleniumbase import Driver
 
-class AuthorProfileCrawler:
-    def __init__(self, db_name="neurips_research.db"):
-        self.db_name = db_name
-        self.driver = None
-        self._ensure_specializations_table()
+class Phase3EnrichmentEngine:
+    def __init__(self, db_path="neurips_research.db"):
+        self.db_path = db_path
+        self.base_scholar_url = "https://scholar.google.com"
+        self._upgrade_database()
 
-    def _ensure_specializations_table(self):
-        """Creates the specializations table just in case Phase 1 missed it."""
-        conn = sqlite3.connect(self.db_name)
+    def _upgrade_database(self):
+        """Automatically adds the necessary Phase 3 columns to your database."""
+        print("🛠️ Checking database schema...")
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS specializations (
-                author_id INTEGER,
-                keyword TEXT,
-                UNIQUE(author_id, keyword)
-            )
-        ''')
+        
+        # Helper function to add columns safely
+        def add_column(table, column, data_type):
+            try:
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {data_type}")
+                print(f"   [+] Added column '{column}' to '{table}'")
+            except sqlite3.OperationalError:
+                pass # Column already exists
+                
+        add_column("authors", "email", "TEXT")
+        add_column("authors", "affiliation", "TEXT")
+        add_column("papers", "or_processed", "INTEGER DEFAULT 0") # Tracks OpenReview status
+        
         conn.commit()
         conn.close()
 
-    def _start_browser(self):
-        self._kill_browser()
-        print("   🌐 Starting fresh browser window...")
-        self.driver = Driver(uc=True, headless=False) # Set to True later for background running
-        time.sleep(2)
-
-    def _kill_browser(self):
-        if self.driver:
-            try:
-                self.driver.quit()
-            except:
-                pass
-            self.driver = None
-
-    def _handle_captcha(self):
-        if "sorry" in self.driver.current_url.lower() or self.driver.is_element_present('div#recaptcha'):
-            print("\n   🚨 CAPTCHA DETECTED! Attempting bypass...")
-            try:
-                self.driver.uc_gui_click_captcha()
-                time.sleep(5)
-            except:
-                pass
-            if "sorry" in self.driver.current_url.lower():
-                raise Exception("Unresolvable CAPTCHA block.")
-
-    def run_crawler(self, limit=50):
-        print(f"--- Starting Author Profile Crawler (Processing up to {limit} authors) ---")
-        
-        conn = sqlite3.connect(self.db_name)
+    def run_openreview_sync(self, batch_size=50):
+        """Fast API pass to find ghost authors and emails."""
+        print(f"\n🚀 [STEP 1] Starting OpenReview API Sync (Batch limit: {batch_size})")
+        conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
-        # Grab authors who have a Google Scholar URL but haven't been crawled yet
-        cursor.execute("SELECT author_id, name, gs_url FROM authors WHERE is_crawled = 0 AND gs_url IS NOT NULL LIMIT ?", (limit,))
-        authors_to_process = cursor.fetchall()
-        
-        if not authors_to_process:
-            print("🎉 All available authors have been crawled!")
+
+        # Grab papers that haven't been checked against OpenReview yet
+        cursor.execute("SELECT paper_id, title FROM papers WHERE is_processed = 1 AND or_processed = 0 LIMIT ?", (batch_size,))
+        papers = cursor.fetchall()
+
+        if not papers:
+            print("   ✅ All processed papers have already been cross-validated with OpenReview.")
             conn.close()
-            return False # Signal that we are out of authors
+            return
 
-        self._start_browser()
-        session_profile_count = 0 # Track profiles per browser window
-
-        for author_id, name, gs_url in authors_to_process:
-            print(f"\n👤 Crawling Profile: {name}")
+        for paper_id, title in papers:
+            encoded_title = urllib.parse.quote(title)
+            url = f"https://api2.openreview.net/notes?content.title={encoded_title}"
             
             try:
-                self._process_single_author(cursor, author_id, gs_url)
-                conn.commit()
+                response = requests.get(url, timeout=10)
+                data = response.json()
                 
-                session_profile_count += 1
-                
-                # --- PREEMPTIVE HARD RESET LOGIC ---
-                if session_profile_count >= 5:
-                    print("   🔄 Preemptive Hard Reset to dodge Google's CAPTCHA...")
-                    self._start_browser()
-                    session_profile_count = 0  # Reset the counter
-                    time.sleep(3) 
+                if data.get('notes'):
+                    best_match = None
+                    best_ratio = 0
+                    
+                    for note in data['notes']:
+                        if 'content' in note and 'title' in note['content']:
+                            api_title = note['content']['title']['value']
+                            ratio = SequenceMatcher(None, title.lower(), api_title.lower()).ratio()
+                            if ratio >= 0.85 and ratio > best_ratio:
+                                best_ratio = ratio
+                                best_match = note
+                                
+                    if best_match:
+                        content = best_match['content']
+                        or_authors = content.get('authors', {}).get('value', [])
+                        or_authorids = content.get('authorids', {}).get('value', [])
+                        
+                        print(f"   ✅ API Match: {title[:40]}... ({len(or_authors)} authors)")
+                        
+                        for i, author_name in enumerate(or_authors):
+                            contact_id = or_authorids[i] if i < len(or_authorids) else None
+                            email = contact_id if contact_id and '@' in contact_id else None
+                            
+                            cursor.execute("SELECT author_id, email FROM authors WHERE name = ?", (author_name,))
+                            row = cursor.fetchone()
+                            
+                            if row:
+                                author_id = row[0]
+                                if email and not row[1]:
+                                    cursor.execute("UPDATE authors SET email = ? WHERE author_id = ?", (email, author_id))
+                            else:
+                                cursor.execute("INSERT INTO authors (name, email) VALUES (?, ?)", (author_name, email))
+                                author_id = cursor.lastrowid
+                                print(f"      👻 Injected missing ghost author: {author_name}")
+                                
+                            cursor.execute("INSERT OR IGNORE INTO paper_authors (paper_id, author_id) VALUES (?, ?)", (paper_id, author_id))
+                    else:
+                        print(f"   ⚠️ Title mismatch on OpenReview: {title[:40]}...")
                 else:
-                    # Normal pacing
-                    delay = random.uniform(3.0, 5.0)
-                    print(f"   ⏳ Waiting {delay:.1f} seconds...")
-                    time.sleep(delay)
+                    print(f"   ❌ Not found on OpenReview: {title[:40]}...")
+                
+                # Mark as processed so we don't query the API for this paper again
+                cursor.execute("UPDATE papers SET or_processed = 1 WHERE paper_id = ?", (paper_id,))
+                conn.commit()
+                time.sleep(0.5) # Be polite to the API server
                 
             except Exception as e:
-                print(f"   💥 Error or block: {e}")
-                print("   🔄 Initiating Emergency Hard Reset...")
-                self._start_browser()
-                session_profile_count = 0 # Reset counter on emergency too
-                time.sleep(3)
+                print(f"   🚨 Error processing {title[:30]}: {e}")
 
         conn.close()
-        self._kill_browser()
-        print("\n--- Crawler Batch Complete ---")
-        return True # Signal that there might be more authors left
 
-    def _process_single_author(self, cursor, author_id, gs_url):
-        self.driver.uc_open_with_reconnect(gs_url, reconnect_time=3)
-        self._handle_captcha()
+    def run_scholar_rescue(self, batch_size=12):
+        """Stealth pass to find URLs and Affiliations for missing authors."""
+        print(f"\n🕵️‍♂️ [STEP 2] Starting Scholar Rescue Mission (Batch limit: {batch_size})")
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
         
-        html = self.driver.get_page_source()
-        soup = BeautifulSoup(html, "html.parser")
+        # Find authors who don't have a Google Scholar URL yet
+        cursor.execute("SELECT author_id, name FROM authors WHERE gs_url IS NULL LIMIT ?", (batch_size,))
+        missing_authors = cursor.fetchall()
         
-        # 1. Extract Headline
-        headline_el = soup.find('div', class_='gsc_prf_il')
-        headline = headline_el.text.strip() if headline_el else None
-        
-        # 2. Extract Homepage URL
-        homepage_el = soup.find('a', string=re.compile('Homepage', re.I))
-        homepage_url = homepage_el['href'] if homepage_el and 'href' in homepage_el.attrs else None
-        
-        # 3. Extract Citations
-        cit_el = soup.select_one('#gsc_rsb_st td.gsc_rsb_std')
-        citations = 0
-        if cit_el:
-            cit_text = cit_el.text.strip().replace(',', '')
-            citations = int(cit_text) if cit_text.isdigit() else 0
+        if not missing_authors:
+            print("   🎉 No missing URLs found! Your database is fully enriched.")
+            conn.close()
+            return
 
-        # Update the authors table
-        cursor.execute("""
-            UPDATE authors 
-            SET headline = ?, homepage_url = ?, citations = ?, is_crawled = 1 
-            WHERE author_id = ?
-        """, (headline, homepage_url, citations, author_id))
-        
-        print(f"   ✓ Citations: {citations} | Homepage Found: {'Yes' if homepage_url else 'No'}")
+        print(f"   🌐 Booting stealth browser for {len(missing_authors)} missing authors...")
+        driver = Driver(uc=True, user_data_dir="chrome_profile", headless=False)
+        time.sleep(random.uniform(2, 4))
 
-        # 4. Extract Specializations/Tags
-        tags = soup.select('.gsc_prf_inta')
-        for tag in tags:
-            keyword = tag.text.strip()
-            if keyword:
-                cursor.execute("""
-                    INSERT OR IGNORE INTO specializations (author_id, keyword) 
-                    VALUES (?, ?)
-                """, (author_id, keyword))
+        try:
+            for i, (author_id, name) in enumerate(missing_authors):
+                print(f"   [{i+1}/{len(missing_authors)}] 🔍 Searching Author: {name}")
+                
+                encoded_name = urllib.parse.quote(name)
+                search_url = f"{self.base_scholar_url}/citations?view_op=search_authors&hl=en&mauthors={encoded_name}"
+                
+                driver.uc_open_with_reconnect(search_url, reconnect_time=3)
+                time.sleep(random.uniform(4, 8)) 
+                
+                soup = BeautifulSoup(driver.get_page_source(), "html.parser")
+                
+                if "detected unusual traffic" in soup.text or 'id="gs_captcha_ccl"' in soup.text:
+                    print("   🚨 CAPTCHA triggered! Google caught us. Stopping rescue mission.")
+                    break
+                
+                first_profile = soup.select_one('.gsc_1usr')
+                
+                if first_profile:
+                    name_link = first_profile.select_one('.gs_ai_name a')
+                    if name_link and name_link.get('href'):
+                        clean_url = self.base_scholar_url + name_link['href'].split('&')[0] 
+                        
+                        affil_el = first_profile.select_one('.gs_ai_aff')
+                        affiliation = affil_el.text.strip() if affil_el else None
+                        
+                        print(f"      ✅ URL: {clean_url}")
+                        if affiliation: print(f"      🏛️ Affiliation: {affiliation}")
+                            
+                        cursor.execute("UPDATE authors SET gs_url = ?, affiliation = ? WHERE author_id = ?", (clean_url, affiliation, author_id))
+                    else:
+                        print("      ⚠️ Profile card found, but no URL extracted.")
+                else:
+                    print("      ❌ No Scholar profile exists.")
+                    cursor.execute("UPDATE authors SET gs_url = 'NO_PROFILE_FOUND' WHERE author_id = ?", (author_id,))
+                
+                conn.commit()
 
+        except Exception as e:
+            print(f"   🚨 Error during scraping: {e}")
+            
+        finally:
+            print("\n🛑 Closing stealth browser...")
+            driver.quit()
+            conn.close()
+            print("💤 Mission complete. Take a cooldown break before running again!")
 
 if __name__ == "__main__":
-    crawler = AuthorProfileCrawler()
+    engine = Phase3EnrichmentEngine()
     
-    # Autonomous batching: Run in chunks of 100, then rest
-    batch = 1
-    while True:
-        print(f"\n🚀 --- INITIATING CRAWLER BATCH {batch} ---")
-        
-        has_more_authors = crawler.run_crawler(limit=100)
-        
-        if not has_more_authors:
-            print("\n🛑 No more authors to crawl. Shutting down automation.")
-            break
-            
-        # Sleep for 30 minutes (1800 seconds) to cool down the IP address
-        print("\n🛌 Batch complete. Sleeping for 30 minutes to protect IP...")
-        time.sleep(1800) 
-        batch += 1
+    # Step 1: Rapid-fire API sync (Safe to do 50 at a time)
+    engine.run_openreview_sync(batch_size=50)
+    
+    # Step 2: Stealth Browser URL rescue (Strictly limit to 12 to avoid bans)
+    engine.run_scholar_rescue(batch_size=12)

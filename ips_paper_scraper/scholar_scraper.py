@@ -252,12 +252,17 @@ class GoogleScholarScraper:
 
     def _process_paper(self, cursor, paper_id, title):
         """Process a single paper"""
+        import re
+        from difflib import SequenceMatcher
+        from datetime import datetime
         
         # Build search URL
+        import urllib.parse
         encoded_title = urllib.parse.quote(title)
         search_url = f"{self.base_url}/scholar?hl=en&q={encoded_title}"
         
         # Navigate to search with randomized timing
+        import time, random
         time.sleep(random.uniform(1, 2))
         self.driver.uc_open_with_reconnect(search_url, reconnect_time=3)
         time.sleep(random.uniform(3, 5))
@@ -267,6 +272,7 @@ class GoogleScholarScraper:
         
         # Get page content
         html = self.driver.get_page_source()
+        from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "html.parser")
         
         # Check for blocks
@@ -292,17 +298,14 @@ class GoogleScholarScraper:
                 if block_type:
                     raise Exception(f"Block persists after wait: {block_type}")
         
-        # Find first result
-        first_result = soup.select_one('.gs_ri')
-        
         # Check if Google explicitly says there are no results
-        if "did not match any articles" in soup or "did not match any articles" in html.lower():
+        if "did not match any articles" in soup.text or "did not match any articles" in html.lower():
             print("   ⚠️ Genuinely no results found on Google Scholar for this paper.")
             cursor.execute("""
                 UPDATE papers SET is_processed = 1, notes = 'Zero results on Scholar' 
                 WHERE paper_id = ?
             """, (paper_id,))
-            return True # Successfully processed (by finding nothing)
+            return True
 
         # --- THE SMART RESULT SELECTOR ---
         results = soup.select('.gs_ri')
@@ -310,37 +313,28 @@ class GoogleScholarScraper:
         result_title = ""
         result_url = None
         
-        # Scan the top 3 results instead of just the first one
         for result in results[:3]: 
             title_el = result.select_one('.gs_rt a')
             if not title_el:
                 title_el = result.select_one('.gs_rt') 
                 
             raw_title = title_el.text.strip() if title_el else ""
-            
-            # Strip tags like [PDF] or [BOOK]
-            import re
             clean_title = re.sub(r'^\[.*?\]\s*', '', raw_title)
             
-            from difflib import SequenceMatcher
             similarity = SequenceMatcher(None, title.lower(), clean_title.lower()).ratio()
             
-            # Check the URL and the green "venue" text underneath the title
             url = title_el.get('href', '').lower() if title_el and title_el.name == 'a' else ""
             venue_info = result.select_one('.gs_a').text.lower() if result.select_one('.gs_a') else ""
             
-            # Does this result explicitly mention NeurIPS?
             is_neurips = "neurips" in url or "nips" in url or "neural information" in venue_info
             
             if similarity >= 0.85:
                 if is_neurips:
-                    # Perfect match! It has the right title AND the NeurIPS signature.
                     best_result = result
                     result_title = clean_title
                     result_url = title_el.get('href') if title_el and title_el.name == 'a' else None
-                    break # Stop looking, we found the golden ticket
+                    break 
                 elif best_result is None:
-                    # Good title, but no explicit NeurIPS tag. Save as backup in case we don't find a better one.
                     best_result = result
                     result_title = clean_title
                     result_url = title_el.get('href') if title_el and title_el.name == 'a' else None
@@ -351,14 +345,13 @@ class GoogleScholarScraper:
                 UPDATE papers SET is_processed = 1, notes = 'Skipped: Result mismatch or no NeurIPS tag' 
                 WHERE paper_id = ?
             """, (paper_id,))
-            return True # Successfully processed (by gracefully skipping)
+            return True 
             
         first_result = best_result
         
-        # Extract abstract from the confirmed best result
+        # Extract abstract
         abstract_el = first_result.select_one('.gs_rs')
         abstract = abstract_el.text.strip().replace('\n', ' ') if abstract_el else "No abstract"
-        # ---------------------------------
         
         # Update paper record
         cursor.execute("""
@@ -367,32 +360,55 @@ class GoogleScholarScraper:
             WHERE paper_id = ?
         """, (abstract, result_title, result_url, datetime.now().isoformat(), paper_id))
         
-        # Extract authors with Google Scholar profiles
-        author_links = first_result.select('.gs_a a[href*="/citations?user="]')
+        # --- THE HYBRID AUTHOR EXTRACTOR (DOM-Optimized) ---
+        author_div = first_result.select_one('.gs_a')
         
-        if author_links:
-            # De-duplicate the links (filters out Google's hidden mobile tags)
-            unique_authors = {}
-            for link in author_links:
-                author_name = link.text.strip()
-                gs_url = self.base_url + link['href']
-                # Only add if we actually grabbed text and haven't seen this URL yet
-                if author_name and gs_url not in unique_authors:
-                    unique_authors[gs_url] = author_name
+        if author_div:
+            # 1. Grab ALL Scholar profiles from the block
+            linked_authors = {}
+            for link in first_result.select('.gs_a a[href*="/citations?user="]'):
+                linked_name = link.text.strip()
+                linked_url = self.base_url + link['href']
+                linked_authors[linked_name] = linked_url
+                
+            # 2. Extract clean author list from hidden DOM or fallback to regex
+            clean_author_div = first_result.select_one('.gs_fmaa')
             
-            print(f"   👥 Found {len(unique_authors)} Google Scholar authors")
+            if clean_author_div:
+                all_author_names = [name.strip() for name in clean_author_div.text.split(',') if name.strip()]
+            else:
+                full_text = author_div.text.replace('\xa0', ' ')
+                parts = re.split(r'\s+[-–—]\s+', full_text)
+                author_chunk = parts[0].replace('\u2026', '').replace('...', '').strip()
+                all_author_names = [name.strip() for name in author_chunk.split(',') if name.strip()]
             
-            for gs_url, author_name in unique_authors.items():
-                # Insert author
+            # 3. Failsafe for weird HTML glitches
+            for linked_name in linked_authors.keys():
+                if linked_name not in all_author_names:
+                    all_author_names.append(linked_name)
+            
+            print(f"   👥 Found {len(all_author_names)} total authors ({len(linked_authors)} have Scholar profiles)")
+            
+            # 4. Save to Database
+            for author_name in all_author_names:
+                gs_url = linked_authors.get(author_name, None)
+                
                 cursor.execute("""
                     INSERT OR IGNORE INTO authors (name, gs_url) 
                     VALUES (?, ?)
                 """, (author_name, gs_url))
                 
-                # Get author_id
-                cursor.execute("SELECT author_id FROM authors WHERE gs_url = ?", (gs_url,))
+                if gs_url:
+                    cursor.execute("SELECT author_id FROM authors WHERE gs_url = ?", (gs_url,))
+                else:
+                    cursor.execute("SELECT author_id FROM authors WHERE name = ? AND gs_url IS NULL", (author_name,))
+                
                 author_row = cursor.fetchone()
                 
+                if not author_row:
+                    cursor.execute("SELECT author_id FROM authors WHERE name = ?", (author_name,))
+                    author_row = cursor.fetchone()
+                        
                 if author_row:
                     author_id = author_row[0]
                     cursor.execute("""
@@ -400,7 +416,7 @@ class GoogleScholarScraper:
                         VALUES (?, ?)
                     """, (paper_id, author_id))
         else:
-            print("   ⚠️ No linked Google Scholar authors found")
+            print("   ⚠️ No author information found in the result")
         
         print("   ✅ Paper processed successfully")
         return True
