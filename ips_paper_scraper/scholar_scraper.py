@@ -450,7 +450,7 @@ def main():
         batch_num += 1
         
         # Long cooldown between batches - let IP reputation recover
-        cooldown_seconds = 600  # 10 minutes
+        cooldown_seconds = 720  # 12 minutes
         print(f"\n🛌 Batch cooldown: {cooldown_seconds}s ({cooldown_seconds//60} minutes)")
         print("   Letting IP reputation recover before next batch...\n")
         
